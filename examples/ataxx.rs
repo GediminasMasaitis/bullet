@@ -5,14 +5,15 @@ trainer in `AtaxxDotCpp/trainer/main.cpp`.
 
 Architecture (must match the engine, which has these sizes baked in):
 
-    (49x2 -> 768)x2 -> 1, ReLU
+    (49x2 -> 768)x2 -> 1, SCReLU or ReLU
 
   * `l0` is shared between the two perspectives. Within a perspective, block 0
     is "us", block 1 is "them", giving 98 inputs.
   * The two accumulators are concatenated, so `l1` is a 1536 -> 1 affine whose
     first 768 weights are the stm set (`hidden_weightses[0]`) and whose last
     768 are the ntm set (`hidden_weightses[1]`).
-  * ReLU, *not* SCReLU - `evaluation_nn.cpp` clamps at zero only.
+  * The activation is picked by SCRELU below and *must* match the `SCRELU`
+    define in the engine's `types.h`, since it changes what the weights mean.
 
 Output files, written to OUT_DIR every SAVE_RATE superbatches. Each run stamps
 its start time into the name so consecutive runs never overwrite each other:
@@ -66,12 +67,17 @@ const EVAL_SCALE: f32 = 512.0;
 /// Quantisation factor for the side `.nnue` file, matching the old trainer.
 const QUANT: i16 = 512;
 
+/// Hidden layer activation: SCReLU (clamp to [0, 1] then square) when true,
+/// plain ReLU when false. Must match the `SCRELU` define in the engine's
+/// `types.h` - a network trained with one is meaningless to the other.
+const SCRELU: bool = true;
+
 /// How many of the 8 D4 orientations to train each position in. 8 reproduces
 /// the LibTorch trainer; 1 disables augmentation, for an A/B test. Samples per
 /// second barely change - a batch is still a batch - but 8 of every batch's
 /// slots now go to one position, so a superbatch covers 8x fewer distinct
 /// positions and `end_superbatch` has to grow to match.
-const SYMMETRIES: usize = 8;
+const SYMMETRIES: usize = 1;
 /// Source records expanded at a time. Kept a multiple of the batch size once
 /// multiplied by SYMMETRIES, so a record's orientations never straddle a batch.
 const EXPAND_CHUNK: usize = 65_536;
@@ -234,8 +240,11 @@ fn main() {
         let l0 = builder.new_affine("l0", INPUTS, HL);
         let l1 = builder.new_affine("l1", 2 * HL, 1);
 
-        let stm_hidden = l0.forward(stm).relu();
-        let ntm_hidden = l0.forward(ntm).relu();
+        let (stm_hidden, ntm_hidden) = if SCRELU {
+            (l0.forward(stm).screlu(), l0.forward(ntm).screlu())
+        } else {
+            (l0.forward(stm).relu(), l0.forward(ntm).relu())
+        };
         let hidden_layer = stm_hidden.concat(ntm_hidden);
         let output = l1.forward(hidden_layer);
 
@@ -353,8 +362,36 @@ fn quantised_format() -> [SavedFormat; 4] {
     save_format().map(|fmt| fmt.round().quantise::<i16>(QUANT))
 }
 
+/// The engine sums `clamp(acc, 0, 128)^2 * weight` into an int32, because
+/// widening it to int64 costs about 3x the nps. That is only safe while
+/// `128 * 128 * sum(|weight|)` stays inside int32, which depends on what
+/// training produced - so check it here rather than assume it.
+fn check_engine_headroom(weights: &ModelWeights, superbatch: usize) {
+    const ENGINE_QUANT: i16 = 128;
+
+    let format = [SavedFormat::id("l1w").round().quantise::<i16>(ENGINE_QUANT)];
+    let Ok(buf) = weights.to_quantised_buffer(&format, false) else {
+        println!("WARNING sb{superbatch}: output weights exceed i16 at the engine's quantisation");
+        return;
+    };
+
+    let total: i64 = buf.chunks_exact(2).map(|b| i64::from(i16::from_le_bytes([b[0], b[1]]).abs())).sum();
+    let worst_case = total * i64::from(ENGINE_QUANT) * i64::from(ENGINE_QUANT);
+    let headroom = f64::from(i32::MAX) / worst_case.max(1) as f64;
+
+    if headroom < 1.0 {
+        println!("WARNING sb{superbatch}: engine eval can overflow int32 (worst case {worst_case}, {headroom:.2}x)");
+    } else if superbatch == 1 || headroom < 2.0 {
+        println!("Engine int32 headroom: {headroom:.1}x worst case");
+    }
+}
+
 fn save(weights: &ModelWeights, run_id: &str, superbatch: usize) {
     let stem = format!("{OUT_DIR}/bullet-{run_id}-sb{superbatch}");
+
+    if SCRELU {
+        check_engine_headroom(weights, superbatch);
+    }
 
     let float_path = format!("{stem}.nnue-floats");
     let floats = weights.to_quantised_buffer(&save_format(), false).unwrap();
