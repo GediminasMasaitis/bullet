@@ -26,6 +26,14 @@ its start time into the name so consecutive runs never overwrite each other:
 The engine quantises the floats itself by 128 at load time, and divides the
 output by 32, so an eval of 1.0 in the loss below lands at 128 * 128 / 32 = 512
 engine centipawns. That is the same 512 scale `forward_no_sig` used.
+
+Ataxx's rules are symmetric under the dihedral group of the square (moves are
+defined by Chebyshev distance, which D4 preserves), so a rotated or reflected
+board has the same value and the same side to move. The LibTorch trainer
+exploited that by averaging the loss over all 8 orientations. `SymmetryExpander`
+below reproduces it exactly: every record is emitted 8 times, once per element
+of D4, and since 8 divides the batch size those copies share a batch - and a
+batch gradient is a mean, so this is identical to averaging 8 losses per sample.
 */
 use std::{
     fs::{self, File},
@@ -36,8 +44,8 @@ use std::{
 use bullet_trainer::{
     model::{ModelDefinition, ModelInputs, ModelInputsMapper, ModelWeights, SavedFormat},
     optimiser::adam::{AdamW, AdamWParams},
-    reader::{FixedSizeData, FixedSizeDataReader, ReadMapLoader},
-    run::{DefaultDevice, TrainingSchedule, TrainingSteps, train},
+    reader::{DataReader, FixedSizeData, FixedSizeDataReader, ReadMapLoader},
+    run::{DefaultDevice, TrainingSchedule, TrainingSteps, logger, train},
 };
 
 /// Engine `EvaluationNnueBase::hidden_size`.
@@ -58,9 +66,49 @@ const EVAL_SCALE: f32 = 512.0;
 /// Quantisation factor for the side `.nnue` file, matching the old trainer.
 const QUANT: i16 = 512;
 
+/// How many of the 8 D4 orientations to train each position in. 8 reproduces
+/// the LibTorch trainer; 1 disables augmentation, for an A/B test. Samples per
+/// second barely change - a batch is still a batch - but 8 of every batch's
+/// slots now go to one position, so a superbatch covers 8x fewer distinct
+/// positions and `end_superbatch` has to grow to match.
+const SYMMETRIES: usize = 8;
+/// Source records expanded at a time. Kept a multiple of the batch size once
+/// multiplied by SYMMETRIES, so a record's orientations never straddle a batch.
+const EXPAND_CHUNK: usize = 65_536;
+
 const DATA_PATH: &str = "C:/shared/ataxx/data/ataxx-bullet.data";
 const OUT_DIR: &str = "C:/shared/ataxx/nets/current";
 const SAVE_RATE: usize = 1;
+
+/// The 8 elements of D4 as permutations of the 49 board squares, indexed
+/// `D4[symmetry][rank * 7 + file]`.
+const D4: [[u8; 49]; 8] = {
+    let mut table = [[0u8; 49]; 8];
+    let mut sym = 0;
+    while sym < 8 {
+        let mut rank = 0;
+        while rank < 7 {
+            let mut file = 0;
+            while file < 7 {
+                let (r, f) = match sym {
+                    0 => (rank, file),                 // identity
+                    1 => (file, 6 - rank),             // rotate 90
+                    2 => (6 - rank, 6 - file),         // rotate 180
+                    3 => (6 - file, rank),             // rotate 270
+                    4 => (file, rank),                 // transpose
+                    5 => (6 - file, 6 - rank),         // anti-transpose
+                    6 => (rank, 6 - file),             // mirror files
+                    _ => (6 - rank, file),             // mirror ranks
+                };
+                table[sym][rank * 7 + file] = (r * 7 + f) as u8;
+                file += 1;
+            }
+            rank += 1;
+        }
+        sym += 1;
+    }
+    table
+};
 
 /// One entry of `ataxx-bullet.data`, as produced by `ataxx_convert.rs`.
 ///
@@ -82,7 +130,63 @@ pub struct AtaxxBoard {
 
 unsafe impl FixedSizeData for AtaxxBoard {}
 
+/// Emits every source record once per D4 orientation, tagging which one in the
+/// spare `extra` byte for the mapper to read. Expanding here rather than in the
+/// graph keeps the model a plain two-input net and costs no disk.
+#[derive(Clone)]
+struct SymmetryExpander<R> {
+    inner: R,
+    symmetries: usize,
+}
+
+impl<R: DataReader<AtaxxBoard>> DataReader<AtaxxBoard> for SymmetryExpander<R> {
+    fn read_chunks<F: FnMut(&[AtaxxBoard]) -> bool>(&self, skip_count: usize, mut f: F) {
+        let mut expanded = Vec::with_capacity(EXPAND_CHUNK * self.symmetries);
+
+        // `skip_count` counts expanded records, the inner reader counts source ones.
+        self.inner.read_chunks(skip_count / self.symmetries, |chunk| {
+            for group in chunk.chunks(EXPAND_CHUNK) {
+                expanded.clear();
+                for pos in group {
+                    for sym in 0..self.symmetries {
+                        let mut copy = *pos;
+                        copy.extra = sym as u8;
+                        expanded.push(copy);
+                    }
+                }
+
+                if f(&expanded) {
+                    return true;
+                }
+            }
+
+            false
+        });
+    }
+}
+
+/// The ntm view is the stm view rotated 180 degrees, so every symmetry must
+/// commute with that rotation for the `48 - stm_sq` below to stay correct.
+/// True because rot180 is central in D4, but cheap enough to prove at startup.
+fn check_symmetries() {
+    for (i, sym) in D4.iter().enumerate() {
+        for sq in 0..49 {
+            assert_eq!(48 - usize::from(sym[sq]), usize::from(sym[48 - sq]), "D4[{i}] does not commute with rot180");
+        }
+
+        let mut seen = [false; 49];
+        for &sq in sym {
+            assert!(!seen[usize::from(sq)], "D4[{i}] is not a permutation");
+            seen[usize::from(sq)] = true;
+        }
+
+        assert!(D4.iter().filter(|other| *other == sym).count() == 1, "D4[{i}] is duplicated");
+    }
+}
+
 fn main() {
+    check_symmetries();
+
     let inputs = ModelInputs::default()
         .add_sparse("stm", (INPUTS, 1), NNZ)
         .add_sparse("ntm", (INPUTS, 1), NNZ)
@@ -95,6 +199,8 @@ fn main() {
         // black is to move to line the stm perspective up with the engine's.
         // The ntm perspective is always the opposite rotation.
         let flip_stm = pos.origstm == 1;
+        // Which D4 orientation this copy of the record represents.
+        let sym = &D4[usize::from(pos.extra)];
 
         let mut i = 0;
         for (block, mut occ) in [(0i32, pos.bbs[0]), (1i32, pos.bbs[1])] {
@@ -102,7 +208,8 @@ fn main() {
                 let sq = occ.trailing_zeros() as i32;
                 occ &= occ - 1;
 
-                let stm_sq = if flip_stm { 48 - sq } else { sq };
+                let oriented = if flip_stm { 48 - sq } else { sq };
+                let stm_sq = i32::from(sym[oriented as usize]);
                 stm[i] = 49 * block + stm_sq;
                 ntm[i] = 49 * (1 - block) + (48 - stm_sq);
                 i += 1;
@@ -145,19 +252,40 @@ fn main() {
     let params = AdamWParams { decay: 0.01, beta1: 0.9, beta2: 0.999, min_weight: -1.98, max_weight: 1.98 };
     let mut optimiser = AdamW::new(defn, weights, device, params).unwrap();
 
-    let reader = FixedSizeDataReader::new(&[DATA_PATH]);
+    let batch_size = 16_384;
+    let batches_per_superbatch = 6104;
+    let end_superbatch = 44;
+    assert_eq!((EXPAND_CHUNK * SYMMETRIES) % batch_size, 0, "a record's orientations must share a batch");
+
+    let reader = SymmetryExpander { inner: FixedSizeDataReader::new(&[DATA_PATH]), symmetries: SYMMETRIES };
     let loader = ReadMapLoader::new(reader, mapper, 4);
 
     let schedule = TrainingSchedule {
-        steps: TrainingSteps {
-            batch_size: 16_384,
-            batches_per_superbatch: 6104,
-            start_superbatch: 1,
-            end_superbatch: 40,
-        },
+        steps: TrainingSteps { batch_size, batches_per_superbatch, start_superbatch: 1, end_superbatch },
         log_rate: 128,
-        lr_schedule: Box::new(|step| if step.superbatch() > 30 { 0.0001 } else { 0.001 }),
+        lr_schedule: Box::new(|step| if step.superbatch() > 34 { 0.0001 } else { 0.001 }),
     };
+
+    // An epoch is one pass over the *distinct* positions in the file. A
+    // superbatch is a fixed number of samples, and with SYMMETRIES = 8 only an
+    // eighth of those are distinct, so it takes 8x as many superbatches to get
+    // through the data. Derived from the file rather than hardcoded so the two
+    // can't drift apart.
+    let positions = fs::metadata(DATA_PATH).unwrap().len() as usize / size_of::<AtaxxBoard>();
+    let distinct_per_superbatch = batch_size * batches_per_superbatch / SYMMETRIES;
+    let superbatches_per_epoch = positions as f32 / distinct_per_superbatch as f32;
+    let total_epochs = end_superbatch as f32 / superbatches_per_epoch;
+
+    println!(
+        "Dataset: {} positions x {SYMMETRIES} orientation(s); 1 epoch = {} superbatches",
+        logger::ansi(positions, logger::num_cs()),
+        logger::ansi(format!("{superbatches_per_epoch:.1}"), logger::num_cs()),
+    );
+    println!(
+        "Scheduled {} superbatches = {} epochs",
+        logger::ansi(end_superbatch, logger::num_cs()),
+        logger::ansi(format!("{total_epochs:.2}"), logger::num_cs()),
+    );
 
     fs::create_dir_all(OUT_DIR).unwrap();
     let run_id = timestamp();
@@ -170,6 +298,14 @@ fn main() {
         |_, _, _| {},
         |optimiser, step| {
             let sb = step.superbatch();
+
+            println!(
+                "Epoch {} / {} ({} distinct positions seen)",
+                logger::ansi(format!("{:.2}", sb as f32 / superbatches_per_epoch), logger::num_cs()),
+                logger::ansi(format!("{total_epochs:.2}"), logger::num_cs()),
+                logger::ansi(sb * distinct_per_superbatch, logger::num_cs()),
+            );
+
             if sb % SAVE_RATE == 0 {
                 let weights = optimiser.cpu_weights().unwrap();
                 save(&weights, &run_id, sb);
