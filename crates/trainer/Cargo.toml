@@ -24,5 +24,9 @@ name = "ataxx"
 path = "../../examples/ataxx.rs"
 
 [[example]]
+name = "ataxx_convert"
+path = "../../examples/ataxx_convert.rs"
+
+[[example]]
 name = "test4"
 path = "../../examples/tests/test4.rs"

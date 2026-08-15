@@ -165,8 +165,9 @@ impl GpuBindings for Cuda {
         error::driver(cuMemcpyHtoDAsync_v2(dst, src, bytes, stream))
     }
 
-    unsafe fn kernel_load(kernel: CUfunction) -> CudaResult {
-        error::driver(cuFuncLoad(kernel))
+    unsafe fn kernel_load(_kernel: CUfunction) -> CudaResult {
+        // cuFuncLoad requires CUDA >= 12.4, kernels load lazily on first launch anyway
+        Ok(())
     }
 
     unsafe fn kernel_destroy(_kernel: CUfunction) -> CudaResult {
@@ -436,7 +437,6 @@ mod raw {
         ) -> CUresult;
 
         // Kernel
-        pub fn cuFuncLoad(function: CUfunction) -> CUresult;
         pub fn cuLaunchKernel(
             f: CUfunction,
             gridDimX: c_uint,
